@@ -27,16 +27,37 @@ var (
 )
 
 const (
-	magic0   = 0x53
-	magic1   = 0x43
-	headLen  = 6
-	crcLen   = 4
-	maxPay   = 1 << 16
+	magic0  = 0x53
+	magic1  = 0x43
+	headLen = 6
+	crcLen  = 4
+	maxPay  = 1 << 16
 	// MinVersion 是可接受的最低协议版本。
 	MinVersion = 1
 	// CurrentVersion 是本端编码时使用的版本。
 	CurrentVersion = 2
+	// MaxBufferedFrame 是单个解码器最多缓存的字节数上限：
+	// 帧头 + 最大 payload + CRC。任何一次 Feed 后缓冲都不会超过它，
+	// 因此长流式输入、坏帧突发与积压都有确定的内存边界。
+	MaxBufferedFrame = headLen + maxPay + crcLen
 )
+
+// FrameError 包装一帧的解码错误，并在可尽力判定时携带该帧声明的
+// 通道名（例如 CRC 失败但 payload 的 TLV 结构仍完整可读）。
+// 无法判定通道（坏 magic、版本不接受、TLV 结构损坏等）时 Channel 为空。
+type FrameError struct {
+	Err     error
+	Channel string
+}
+
+func (e *FrameError) Error() string { return e.Err.Error() }
+func (e *FrameError) Unwrap() error { return e.Err }
+
+// Event 是解码器按接收顺序输出的一帧结果：Msg 与 Err 互斥非空其一。
+type Event struct {
+	Msg Message
+	Err error
+}
 
 // 已知字段 tag。
 const (
@@ -117,7 +138,22 @@ func NewDecoder(knownTags ...uint8) *Decoder {
 
 // Feed 追加数据并尽可能解码，返回成功解码的报文与逐帧错误（可区分原因）。
 // 一次失败仅丢弃对应帧并重新同步到下一个 magic，后续正常报文不受影响。
+// 错误为 *FrameError，可尽力携带该帧声明的通道名（见 FeedEvents）。
 func (d *Decoder) Feed(data []byte) (msgs []Message, errs []error) {
+	for _, ev := range d.FeedEvents(data) {
+		if ev.Err != nil {
+			errs = append(errs, ev.Err)
+		} else {
+			msgs = append(msgs, ev.Msg)
+		}
+	}
+	return msgs, errs
+}
+
+// FeedEvents 追加数据并尽可能解码，按字节流中的接收顺序返回逐帧事件
+// （Msg 与 Err 互斥）。调用方据此保证“异常帧”与“正常帧”按真实到达
+// 顺序计入对应通道，连续异常计数不会被乱序处理破坏。
+func (d *Decoder) FeedEvents(data []byte) (events []Event) {
 	d.buf = append(d.buf, data...)
 	for {
 		i := indexMagic(d.buf)
@@ -128,41 +164,50 @@ func (d *Decoder) Feed(data []byte) (msgs []Message, errs []error) {
 			} else {
 				d.buf = d.buf[:0]
 			}
-			return msgs, errs
+			return events
 		}
 		if i > 0 {
-			errs = append(errs, ErrBadMagic)
+			events = append(events, Event{Err: &FrameError{Err: ErrBadMagic}})
 			d.buf = d.buf[i:]
 		}
 		if len(d.buf) < headLen {
-			return msgs, errs // 等待更多数据
+			return events // 等待更多数据
 		}
 		ver := d.buf[2]
 		plen := int(d.buf[4])<<8 | int(d.buf[5])
 		if ver < MinVersion {
-			errs = append(errs, ErrUnsupportedVersion)
+			events = append(events, Event{Err: &FrameError{Err: ErrUnsupportedVersion}})
 			d.buf = d.buf[1:] // 跳过一个字节重新同步
 			continue
 		}
 		total := headLen + plen + crcLen
 		if len(d.buf) < total {
-			return msgs, errs // 帧不完整，等待更多数据
+			// 整帧未到齐。maxPay 是 16 位 payloadLen 的天然上限，
+			// 因此这里的等待缓冲不会超过 MaxBufferedFrame。
+			return events
 		}
 		frame := d.buf[:total]
 		d.buf = d.buf[total:]
 		want := binary.BigEndian.Uint32(frame[total-crcLen:])
 		if crc32.ChecksumIEEE(frame[:total-crcLen]) != want {
-			errs = append(errs, ErrBadCRC)
+			// CRC 失败时 payload 不可信，但仍尽力提取其声明的通道，
+			// 使坏帧能归属到具体通道；提取失败（结构模糊）则归属未知。
+			ch := ExtractChannel(frame[headLen : total-crcLen])
+			events = append(events, Event{Err: &FrameError{Err: ErrBadCRC, Channel: ch}})
 			continue
 		}
 		msg, err := d.parsePayload(ver, Type(frame[3]), frame[headLen:total-crcLen])
 		if err != nil {
-			errs = append(errs, err)
+			// payload TLV 已通过结构解析；尽力归属其通道字段。
+			events = append(events, Event{Err: &FrameError{Err: err, Channel: ExtractChannel(frame[headLen : total-crcLen])}})
 			continue
 		}
-		msgs = append(msgs, msg)
+		events = append(events, Event{Msg: msg})
 	}
 }
+
+// Buffered 返回当前等待完整帧的缓冲字节数，恒不超过 MaxBufferedFrame。
+func (d *Decoder) Buffered() int { return len(d.buf) }
 
 // Finish 在输入结束时调用；若缓冲区残留不完整帧则报告 ErrTruncated。
 func (d *Decoder) Finish() error {
@@ -236,4 +281,38 @@ func GetF64(m Message, tag uint8) (float64, error) {
 		return 0, err
 	}
 	return math.Float64frombits(u), nil
+}
+
+// ExtractChannel 尽力从 payload 中提取其声明的通道名。
+// 仅当整个 payload 是结构完整的 TLV 序列、且通道字段恰好出现一次、
+// 长度合法（1..32 字节）时返回该通道名；TLV 损坏、通道字段缺失、
+// 重复或长度非法都返回空串（无法可靠归属，调用方按不可归属处理）。
+func ExtractChannel(payload []byte) string {
+	var ch string
+	found := false
+	for len(payload) > 0 {
+		if len(payload) < 2 {
+			return ""
+		}
+		tag, l := payload[0], int(payload[1])
+		payload = payload[2:]
+		if len(payload) < l {
+			return ""
+		}
+		if tag == TagChannel {
+			spec := fieldSpecs[TagChannel]
+			if l < spec.min || l > spec.max {
+				return ""
+			}
+			if found {
+				return "" // 重复声明通道，归属模糊
+			}
+			ch, found = string(payload[:l]), true
+		}
+		payload = payload[l:]
+	}
+	if !found {
+		return ""
+	}
+	return ch
 }

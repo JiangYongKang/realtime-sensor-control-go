@@ -121,13 +121,22 @@ func TestBusFailureDoesNotAffectSubsequent(t *testing.T) {
 	sys, _ := newSystem()
 	good := protocol.Encode(protocol.Message{
 		Version: protocol.CurrentVersion, Type: protocol.TypeSample,
-		Fields: map[uint8][]byte{protocol.TagSeq: protocol.U64(7)},
+		Fields: map[uint8][]byte{
+			protocol.TagSeq:     protocol.U64(7),
+			protocol.TagValue:   protocol.F64(21.5),
+			protocol.TagChannel: []byte("ch"),
+		},
 	})
 	bad := append([]byte(nil), good...)
 	bad[len(bad)-1] ^= 0xFF
 	msgs, errs := sys.FeedBus(append(bad, good...))
 	if len(msgs) != 1 || len(errs) != 1 {
 		t.Fatalf("msgs=%d errs=%v", len(msgs), errs)
+	}
+	// 坏帧尽力归属到 ch，好帧紧随其后被接受：连续异常清零，通道不降级。
+	st := sys.Snapshot().Channels["ch"]
+	if st.State != "OK" || st.BadStreak != 0 || st.BadTotal != 1 {
+		t.Fatalf("坏帧+好帧后状态错误: %+v", st)
 	}
 }
 
@@ -136,7 +145,11 @@ func TestConcurrentAccess(t *testing.T) {
 	sys.Advance(start)
 	frame := protocol.Encode(protocol.Message{
 		Version: protocol.CurrentVersion, Type: protocol.TypeControl,
-		Fields: map[uint8][]byte{protocol.TagSeq: protocol.U64(1)},
+		Fields: map[uint8][]byte{
+			protocol.TagSeq:     protocol.U64(1),
+			protocol.TagValue:   protocol.F64(1),
+			protocol.TagChannel: []byte("ch"),
+		},
 	})
 	var wg sync.WaitGroup
 	stop := make(chan struct{})

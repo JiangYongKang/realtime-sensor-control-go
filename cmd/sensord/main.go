@@ -49,25 +49,39 @@ func main() {
 	fmt.Println("== 恢复推进 0.5s 后 ==")
 	printSnap(sys)
 
-	// 总线：一帧损坏 + 一帧正常，失败不影响后续报文。
-	good := protocol.Encode(protocol.Message{
-		Version: protocol.CurrentVersion, Type: protocol.TypeSample,
-		Fields: map[uint8][]byte{
-			protocol.TagSeq:   protocol.U64(1),
-			protocol.TagValue: protocol.F64(21.5),
-		},
-	})
-	corrupt := append([]byte(nil), good...)
-	corrupt[len(corrupt)-1] ^= 0xFF // 破坏 CRC
-	msgs, errs := sys.FeedBus(append(corrupt, good...))
-	fmt.Printf("== 总线：损坏帧+正常帧 ==\n解码成功 %d 帧，错误 %v\n", len(msgs), errs)
+	// 总线：fast 通道连续 3 帧坏报文 -> 当批内进入 SAFE；随后一帧更新
+	// 序号的新报文立即恢复。slow 通道全程不受影响。
+	chFrame := func(id string, seq uint64, v float64) []byte {
+		return protocol.Encode(protocol.Message{
+			Version: protocol.CurrentVersion, Type: protocol.TypeSample,
+			Fields: map[uint8][]byte{
+				protocol.TagSeq:     protocol.U64(seq),
+				protocol.TagValue:   protocol.F64(v),
+				protocol.TagChannel: []byte(id),
+			},
+		})
+	}
+	var stream []byte
+	for i := 0; i < 3; i++ {
+		f := chFrame("fast", uint64(i+1), 21.5)
+		f[len(f)-1] ^= 0xFF
+		stream = append(stream, f...)
+	}
+	stream = append(stream, chFrame("slow", 1, 5.0)...)    // slow 正常报文
+	stream = append(stream, chFrame("fast", 100, 22.0)...) // fast 恢复（新序号）
+	msgs, errs := sys.FeedBus(stream)
+	fmt.Printf("== 总线：fast 连续 3 坏帧 -> SAFE -> 新报文恢复；slow 不受影响 ==\n解码成功 %d 帧，错误 %d 个\n", len(msgs), len(errs))
+	printSnap(sys)
+	snap := sys.Snapshot()
+	fmt.Printf("  不可归属帧累计=%d\n", snap.UnroutableTotal)
 }
 
 func printSnap(sys *system.System) {
 	snap := sys.Snapshot()
 	for _, id := range []string{"fast", "slow"} {
 		st := snap.Channels[id]
-		fmt.Printf("  %-4s state=%-4s misses=%d late=%d last=%.3f seq=%d out=%.3f\n",
-			id, st.State, st.ConsecMisses, st.LateTotal, st.LastValue, st.LastSeq, st.Output)
+		fmt.Printf("  %-4s state=%-4s misses=%d late=%d bad=%d(streak %d) reorder=%d last=%.3f seq=%d out=%.3f\n",
+			id, st.State, st.ConsecMisses, st.LateTotal, st.BadTotal, st.BadStreak,
+			st.ReorderTotal, st.LastValue, st.LastSeq, st.Output)
 	}
 }
