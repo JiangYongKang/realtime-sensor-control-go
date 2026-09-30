@@ -60,14 +60,48 @@ func main() {
 	corrupt := append([]byte(nil), good...)
 	corrupt[len(corrupt)-1] ^= 0xFF // 破坏 CRC
 	msgs, errs := sys.FeedBus(append(corrupt, good...))
-	fmt.Printf("== 总线：损坏帧+正常帧 ==\n解码成功 %d 帧，错误 %v\n", len(msgs), errs)
+	fmt.Printf("== 复用总线：损坏帧+无通道正常帧 ==\n解码成功 %d 帧，错误 %v，未归属 %d\n",
+		len(msgs), errs, sys.Snapshot().BusUnrouted)
+
+	// 通道级总线：带通道字段的复用帧按通道落地。
+	chanFrame := func(id string, seq uint64, v float64) []byte {
+		return protocol.Encode(protocol.Message{
+			Version: protocol.CurrentVersion, Type: protocol.TypeControl,
+			Fields: map[uint8][]byte{
+				protocol.TagSeq:     protocol.U64(seq),
+				protocol.TagValue:   protocol.F64(v),
+				protocol.TagChannel: []byte(id),
+			},
+		})
+	}
+	sys.FeedBus(chanFrame("fast", 1, 42.0))
+	fmt.Println("== 复用总线带通道字段的控制帧落到 fast ==")
+	printSnap(sys)
+
+	// fast 通道专用总线上连续坏帧：只让 fast 降级，slow 不受影响。
+	bad := func(b []byte) []byte {
+		c := append([]byte(nil), b...)
+		c[len(c)-1] ^= 0xFF
+		return c
+	}
+	for i := 0; i < 3; i++ {
+		sys.FeedChannelBus("fast", bad(chanFrame("fast", uint64(10+i), 1)))
+	}
+	fmt.Println("== fast 连续 3 帧坏报文：fast 切 SAFE，slow 不受影响 ==")
+	printSnap(sys)
+
+	// 一帧恢复后的新报文：fast 回到 OK，输出只来自新报文。
+	sys.FeedChannelBus("fast", chanFrame("fast", 100, 7.5))
+	fmt.Println("== fast 收到一帧恢复后的新报文：回到 OK ==")
+	printSnap(sys)
 }
 
 func printSnap(sys *system.System) {
 	snap := sys.Snapshot()
 	for _, id := range []string{"fast", "slow"} {
 		st := snap.Channels[id]
-		fmt.Printf("  %-4s state=%-4s misses=%d late=%d last=%.3f seq=%d out=%.3f\n",
-			id, st.State, st.ConsecMisses, st.LateTotal, st.LastValue, st.LastSeq, st.Output)
+		fmt.Printf("  %-4s state=%-4s bus=%-4s bfails=%d in=%d/%d last=%.3f seq=%d busSeq=%d out=%.3f\n",
+			id, st.State, st.BusState, st.BusConsecFails, st.BusAccepted, st.BusRejected,
+			st.LastValue, st.LastSeq, st.BusLastSeq, st.Output)
 	}
 }

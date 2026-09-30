@@ -27,11 +27,13 @@ var (
 )
 
 const (
-	magic0   = 0x53
-	magic1   = 0x43
-	headLen  = 6
-	crcLen   = 4
-	maxPay   = 1 << 16
+	magic0  = 0x53
+	magic1  = 0x43
+	headLen = 6
+	crcLen  = 4
+	maxPay  = 1 << 16
+	// DefaultMaxBuffered 是单个流式解码器的默认缓冲上限（单帧最大 64KiB+10）。
+	DefaultMaxBuffered = 256 * 1024
 	// MinVersion 是可接受的最低协议版本。
 	MinVersion = 1
 	// CurrentVersion 是本端编码时使用的版本。
@@ -102,13 +104,22 @@ func Encode(m Message) []byte {
 
 // Decoder 从字节流中逐帧解码，单帧失败不影响后续帧。
 type Decoder struct {
-	known map[uint8]bool
-	buf   []byte
+	known  map[uint8]bool
+	buf    []byte
+	maxBuf int // 缓冲上限，<=0 表示不限
 }
 
 // NewDecoder 创建解码器，knownTags 为本端认识的字段 tag 集合。
+// 缓冲上限取 DefaultMaxBuffered：单路坏帧突发/巨长流不会无限积压。
 func NewDecoder(knownTags ...uint8) *Decoder {
-	d := &Decoder{known: map[uint8]bool{}}
+	return NewBoundedDecoder(DefaultMaxBuffered, knownTags...)
+}
+
+// NewBoundedDecoder 创建带显式缓冲上限的解码器；maxBuf<=0 表示不设上限。
+// 当残留缓冲与新输入合计超过上限时，残留被丢弃并对调用方报告一次
+// ErrTruncated（积压有界、后续正常帧继续解码）。
+func NewBoundedDecoder(maxBuf int, knownTags ...uint8) *Decoder {
+	d := &Decoder{known: map[uint8]bool{}, maxBuf: maxBuf}
 	for _, t := range knownTags {
 		d.known[t] = true
 	}
@@ -118,6 +129,12 @@ func NewDecoder(knownTags ...uint8) *Decoder {
 // Feed 追加数据并尽可能解码，返回成功解码的报文与逐帧错误（可区分原因）。
 // 一次失败仅丢弃对应帧并重新同步到下一个 magic，后续正常报文不受影响。
 func (d *Decoder) Feed(data []byte) (msgs []Message, errs []error) {
+	if d.maxBuf > 0 && len(d.buf)+len(data) > d.maxBuf {
+		// 积压将超上限：丢弃当前残留（视作一帧被截断），从新输入重新开始，
+		// 保证任意输入长度下内存占用有界。
+		d.buf = d.buf[:0]
+		errs = append(errs, ErrTruncated)
+	}
 	d.buf = append(d.buf, data...)
 	for {
 		i := indexMagic(d.buf)
@@ -236,4 +253,13 @@ func GetF64(m Message, tag uint8) (float64, error) {
 		return 0, err
 	}
 	return math.Float64frombits(u), nil
+}
+
+// GetChannel 读取 1..32 字节通道名字段；缺失或长度非法时返回 ErrInvalidField。
+func GetChannel(m Message) (string, error) {
+	v, ok := m.Fields[TagChannel]
+	if !ok || len(v) < 1 || len(v) > 32 {
+		return "", ErrInvalidField
+	}
+	return string(v), nil
 }

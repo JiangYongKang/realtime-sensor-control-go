@@ -125,3 +125,28 @@ func TestUnknownTagsIgnoredByReceiverWithoutThem(t *testing.T) {
 		t.Fatalf("未知 tag 应进入 Unknown: %+v", msgs[0])
 	}
 }
+
+func TestBoundedDecoderDropsOverrunAndRecovers(t *testing.T) {
+	d := NewBoundedDecoder(128, TagSeq, TagValue)
+	// 先放入一帧不完整数据作为残留。
+	partial := Encode(sampleMsg())[:20]
+	if _, errs := d.Feed(partial); len(errs) != 0 {
+		t.Fatalf("等待中的残帧不应报错: %v", errs)
+	}
+	// 再喂入超过上限的数据：残留被丢弃并报告 ErrTruncated，随后正常帧照解。
+	good := Encode(sampleMsg())
+	huge := make([]byte, 200)
+	msgs, errs := d.Feed(append(huge, good...))
+	foundTrunc := false
+	for _, e := range errs {
+		if e == ErrTruncated {
+			foundTrunc = true
+		}
+	}
+	if !foundTrunc {
+		t.Fatalf("超限积压应报告 ErrTruncated, errs=%v", errs)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("积压丢弃后正常帧应继续解码, got %d", len(msgs))
+	}
+}
