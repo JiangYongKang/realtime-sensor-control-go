@@ -14,8 +14,15 @@
 //     立即清零连续异常计数。
 //   - 乱序：序号回退量不超过 ReorderTolerance（默认 0）的帧被接受，
 //     但不推进序号基线；回退超过容忍量或序号重复按异常处理。
-//   - 恢复：SAFE 后收到连续 RecoveryFrames（默认 1）帧有效报文才回 OK；
-//     进入 SAFE 时序号基线与累计异常即被丢弃，恢复后的首帧建立新基线。
+//   - 恢复：SAFE 后需要连续 RecoveryFrames（默认 1）帧“故障后新报文”才回
+//     OK。故障后新报文指序号严格大于故障前已接受最大序号（恢复门槛）的帧；
+//     与门槛相同（重复故障前序号）、比门槛更旧（倒退）、容忍范围内乱序帧
+//     都不算恢复：不推进恢复进度，并把已累计的恢复进度清零重算；只有真正
+//     更新的报文才推进恢复进度并最终驱动输出。不带序号的活性帧无法证明其
+//     产生于故障之后，SAFE 期间既不推进也不清零恢复进度。
+//   - 进入 SAFE 时丢弃连续异常计数、时间窗历史与恢复进度，但保留故障前已
+//     接受的最大序号作为恢复门槛；外部 Reset（如看门狗联动要求全清）才丢弃
+//     门槛，此后首帧建立全新基线。
 package busfault
 
 import "time"
@@ -81,11 +88,13 @@ func (c Config) Normalize() Config {
 type Monitor struct {
 	cfg Config
 
-	safe        bool
-	consec      int // 当前连续异常数
-	recovery    int // SAFE 后连续有效报文数
+	safe     bool
+	consec   int // 当前连续异常数
+	recovery int // SAFE 后连续“故障后新报文”数
+	// hasBaseline/baseline 为已接受的最大序号（高水位）。进入 SAFE 时
+	// 不丢弃，作为恢复门槛：恢复报文必须严格大于 baseline。
 	hasBaseline bool
-	baseline    uint64      // 已接受的最大序号
+	baseline    uint64
 	failTimes   []time.Time // Window>0 时记录的异常时刻（有界）
 	accepted    uint64
 	rejected    uint64
@@ -100,34 +109,38 @@ func New(cfg Config) *Monitor {
 func (m *Monitor) Frame(at time.Time, seq uint64) Result {
 	m.prune(at)
 	if !m.hasBaseline {
-		// 启动后或 SAFE 复位后的首帧：建立全新序号基线。
+		// 启动后或外部 Reset 后的首帧：建立全新序号基线。SAFE 期间它
+		// 也被视为故障后新报文（此前没有任何已接受序号可作为门槛）。
 		m.hasBaseline = true
 		m.baseline = seq
-		return m.noteAccepted(at, Accepted)
+		return m.noteFresh(at, Accepted)
 	}
 	switch {
 	case seq > m.baseline:
 		m.baseline = seq
-		return m.noteAccepted(at, Accepted)
+		return m.noteFresh(at, Accepted)
 	case seq == m.baseline:
-		m.Fail(at) // 序号重复：计一次异常
+		m.Fail(at) // 序号重复（含故障前最后序号）：计一次异常
 		return Rejected
 	default:
 		gap := m.baseline - seq
 		if gap <= m.cfg.ReorderTolerance {
 			// 容忍范围内的迟到乱序帧：接受但不推进基线，避免旧帧拉低基线。
-			return m.noteAccepted(at, AcceptedReordered)
+			return m.noteTolerated(at, AcceptedReordered)
 		}
-		m.Fail(at) // 真正倒退：计一次异常
+		m.Fail(at) // 真正倒退（比故障前已接受序号更旧）：计一次异常
 		return Rejected
 	}
 }
 
-// Alive 处理一帧结构合法但不带序号的报文：仅作为活性信号，
-// 清零连续异常并参与恢复计数，但不建立或推进序号基线。
+// Alive 处理一帧结构合法但不带序号的报文：正常状态下作为活性信号清零
+// 连续异常计数。SAFE 期间它无法证明产生于故障之后（没有序号），因此
+// 不推进恢复进度，也不清零已经累计的恢复进度；不建立或推进序号基线。
 func (m *Monitor) Alive(at time.Time) Result {
 	m.prune(at)
-	return m.noteAccepted(at, Liveness)
+	m.accepted++
+	m.consec = 0
+	return Liveness
 }
 
 // Fail 记录一次无法接受的报文（结构不完整/校验失败/版本/字段非法等）。
@@ -153,10 +166,11 @@ func (m *Monitor) Tick(now time.Time) {
 	}
 }
 
-// noteAccepted 统一处理被接受报文的计数、清零与恢复推进。
+// noteFresh 处理“故障后新报文”（序号严格大于高水位，或无基线后的首帧）：
+// 清零连续异常计数；SAFE 期间推进恢复进度，集齐 RecoveryFrames 帧后回 OK。
 // 注意：连续异常计数清零，但时间窗内的失败历史保留——窗口模式的意义
 // 正是让夹杂正常帧的坏帧突发在窗口累计达标时仍能触发降级。
-func (m *Monitor) noteAccepted(at time.Time, r Result) Result {
+func (m *Monitor) noteFresh(at time.Time, r Result) Result {
 	m.accepted++
 	m.consec = 0
 	if m.safe {
@@ -169,14 +183,30 @@ func (m *Monitor) noteAccepted(at time.Time, r Result) Result {
 	return r
 }
 
-// trip 进入安全状态并丢弃故障前的全部累计状态。
-func (m *Monitor) trip() {
-	m.safe = true
-	m.Reset()
+// noteTolerated 处理容忍范围内的乱序帧：清零连续异常计数，但它携带的是
+// 旧序号，不是故障后新报文——SAFE 期间不得推进恢复进度，并把此前累计的
+// 恢复进度清零，恢复进度只由连续的真正更新报文重新建立。
+func (m *Monitor) noteTolerated(at time.Time, r Result) Result {
+	m.accepted++
+	m.consec = 0
+	if m.safe {
+		m.recovery = 0
+	}
+	return r
 }
 
-// Reset 丢弃序号基线、连续异常与恢复计数。
-// 在通道进入安全状态时调用，保证恢复后不沿用故障前状态。
+// trip 进入安全状态：丢弃连续异常、时间窗历史与恢复进度，但保留序号高水
+// 位作为恢复门槛，保证故障前用过的序号无法触发恢复、无法驱动输出。
+func (m *Monitor) trip() {
+	m.safe = true
+	m.consec = 0
+	m.recovery = 0
+	m.failTimes = m.failTimes[:0]
+}
+
+// Reset 丢弃序号基线、连续异常、时间窗与恢复进度，但不改变 SAFE 标志。
+// 供看门狗联动等外部场景使用：外部已通过其他故障源决定通道安全性，这里
+// 只丢弃故障前累计；此后首帧建立全新基线。总线自身降级走 trip，保留门槛。
 func (m *Monitor) Reset() {
 	m.hasBaseline = false
 	m.baseline = 0
@@ -184,6 +214,9 @@ func (m *Monitor) Reset() {
 	m.recovery = 0
 	m.failTimes = m.failTimes[:0]
 }
+
+// RecoveryProgress 返回 SAFE 后已连续收到的故障后新报文数（0..RecoveryFrames-1）。
+func (m *Monitor) RecoveryProgress() int { return m.recovery }
 
 // prune 丢弃已滑出时间窗的异常时刻（at-t >= Window 视为过期）。
 func (m *Monitor) prune(at time.Time) {

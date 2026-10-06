@@ -46,17 +46,92 @@ func TestRecoveryUsesFreshFramesOnly(t *testing.T) {
 	if !m.Safe() {
 		t.Fatal("应进入 SAFE")
 	}
-	// 故障前序号 100 的旧帧重发：基线已被丢弃，它会被当作恢复后首帧接受，
-	// 建立新基线 100（而不是被判为倒退）——恢复只看恢复之后的报文。
-	if r := m.Frame(t0.Add(40*time.Millisecond), 100); r != Accepted {
-		t.Fatalf("result=%v, want Accepted as fresh baseline", r)
+	// 故障前序号 100 的旧帧重发：与故障前最新序号相同，不算恢复，
+	// 计一次异常，通道仍处于 SAFE。
+	if r := m.Frame(t0.Add(40*time.Millisecond), 100); r != Rejected {
+		t.Fatalf("重复故障前序号 result=%v, want Rejected", r)
 	}
-	if m.Safe() {
-		t.Fatal("默认 1 帧恢复：应回到 OK")
+	if !m.Safe() {
+		t.Fatal("故障前旧序号不能触发恢复")
+	}
+	// 比故障前更旧的序号同样不算恢复。
+	if r := m.Frame(t0.Add(45*time.Millisecond), 99); r != Rejected {
+		t.Fatalf("倒退序号 result=%v, want Rejected", r)
+	}
+	if !m.Safe() {
+		t.Fatal("比故障前更旧的序号不能触发恢复")
+	}
+	// 严格大于故障前最新序号（100）的报文才是故障后新报文，默认 1 帧恢复。
+	if r := m.Frame(t0.Add(50*time.Millisecond), 101); r != Accepted || m.Safe() {
+		t.Fatalf("真正更新的报文应恢复: result=%v safe=%v", r, m.Safe())
 	}
 	// 恢复后下一个更大的序号被接受。
-	if r := m.Frame(t0.Add(50*time.Millisecond), 101); r != Accepted || m.Safe() {
+	if r := m.Frame(t0.Add(60*time.Millisecond), 102); r != Accepted || m.Safe() {
 		t.Fatalf("result=%v safe=%v", r, m.Safe())
+	}
+}
+
+func TestRecoveryProgressResetByStaleFrames(t *testing.T) {
+	// RecoveryFrames=3：旧报文穿插时恢复进度按确定规则重新计算。
+	m := New(Config{MaxConsecutive: 1, RecoveryFrames: 3})
+	m.Frame(t0, 10)
+	m.Fail(t0.Add(5 * time.Millisecond))
+	if !m.Safe() {
+		t.Fatal("阈值 1 应立即 SAFE")
+	}
+	// 第一帧真正更新的报文：进度 1/3。
+	m.Frame(t0.Add(10*time.Millisecond), 11)
+	if p := m.RecoveryProgress(); p != 1 || !m.Safe() {
+		t.Fatalf("进度=%d safe=%v, want 1/SAFE", p, m.Safe())
+	}
+	// 旧报文（重复当前已接受最大序号）：不算恢复，进度清零。
+	if r := m.Frame(t0.Add(20*time.Millisecond), 11); r != Rejected {
+		t.Fatalf("重复序号 result=%v", r)
+	}
+	if p := m.RecoveryProgress(); p != 0 {
+		t.Fatalf("旧报文后进度应清零, got %d", p)
+	}
+	// 再来一帧真正更新：只算 1/3，而不是接着之前的进度。
+	m.Frame(t0.Add(30*time.Millisecond), 12)
+	if p := m.RecoveryProgress(); p != 1 || !m.Safe() {
+		t.Fatalf("旧报文后恢复进度应重新计算: %d safe=%v", p, m.Safe())
+	}
+	// 容忍范围内乱序帧也不推进恢复，并清零已累计进度。
+	m2 := New(Config{MaxConsecutive: 1, RecoveryFrames: 2, ReorderTolerance: 5})
+	m2.Frame(t0, 20)
+	m2.Fail(t0.Add(5 * time.Millisecond))
+	m2.Frame(t0.Add(10*time.Millisecond), 21) // 进度 1/2
+	if r := m2.Frame(t0.Add(20*time.Millisecond), 18); r != AcceptedReordered {
+		t.Fatalf("容忍内乱序 result=%v", r)
+	}
+	if p := m2.RecoveryProgress(); p != 0 || !m2.Safe() {
+		t.Fatalf("乱序旧帧应清零恢复进度: p=%d safe=%v", p, m2.Safe())
+	}
+	// 连续两帧真正更新后恢复。
+	m2.Frame(t0.Add(30*time.Millisecond), 22)
+	m2.Frame(t0.Add(40*time.Millisecond), 23)
+	if m2.Safe() {
+		t.Fatal("连续两帧故障后新报文后应恢复")
+	}
+}
+
+func TestRecoveryLivenessDoesNotDriveRecovery(t *testing.T) {
+	m := New(Config{MaxConsecutive: 1, RecoveryFrames: 2})
+	m.Frame(t0, 5)
+	m.Fail(t0.Add(5 * time.Millisecond))
+	// SAFE 期间活性帧既不推进恢复，也不清零已有进度。
+	m.Alive(t0.Add(10 * time.Millisecond))
+	if p := m.RecoveryProgress(); p != 0 || !m.Safe() {
+		t.Fatalf("活性帧不应推进恢复: p=%d safe=%v", p, m.Safe())
+	}
+	m.Frame(t0.Add(20*time.Millisecond), 6) // 1/2
+	m.Alive(t0.Add(25 * time.Millisecond))
+	if p := m.RecoveryProgress(); p != 1 {
+		t.Fatalf("活性帧不应改变恢复进度, got %d", p)
+	}
+	m.Frame(t0.Add(30*time.Millisecond), 7)
+	if m.Safe() {
+		t.Fatal("两帧故障后新报文后应恢复")
 	}
 }
 

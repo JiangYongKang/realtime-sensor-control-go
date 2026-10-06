@@ -41,8 +41,10 @@ type ChannelStatus struct {
 	BusState string
 	// BusConsecFails 为总线连续异常帧数。
 	BusConsecFails int
-	BusAccepted    uint64
-	BusRejected    uint64
+	// BusRecovery 为 SAFE 后已连续收到的故障后新报文数（恢复进度）。
+	BusRecovery int
+	BusAccepted uint64
+	BusRejected uint64
 	// BusLastSeq/BusLastValue 为最近一次被接受的总线报文序号与载荷值。
 	BusLastSeq   uint64
 	BusLastValue float64
@@ -273,7 +275,10 @@ func (s *System) FinishChannelBus(id string) error {
 //   - 乱序容忍帧（AcceptedReordered）只清零异常计数，不应用载荷，
 //     避免迟到旧数据覆盖当前输出。
 //   - 只要看门狗或总线监控任一处于 SAFE，所有载荷都不生效，输出保持
-//     安全值；恢复后的首帧建立全新序号基线并重新开始。
+//     安全值。总线自身降级时保留故障前最大序号作为恢复门槛：与门槛相同
+//     或更旧的报文（重复、倒退、容忍内乱序）不算恢复、不改输出、不推进
+//     恢复进度；只有序号严格更大的故障后新报文连续集齐 RecoveryFrames
+//     帧才解除 SAFE 并采用其值。看门狗联动触发的 Reset 才丢弃门槛。
 func (s *System) applyMessage(ch *channelState, m protocol.Message, now time.Time) {
 	var r busfault.Result
 	seqVal, seqErr := protocol.GetU64(m, protocol.TagSeq)
@@ -330,6 +335,7 @@ func (s *System) Snapshot() Snapshot {
 			Output:         ch.output,
 			BusState:       s.busStateString(ch),
 			BusConsecFails: ch.bus.Consecutive(),
+			BusRecovery:    ch.bus.RecoveryProgress(),
 			BusAccepted:    ch.bus.AcceptedTotal(),
 			BusRejected:    ch.bus.RejectedTotal(),
 			BusLastSeq:     ch.busSeq,

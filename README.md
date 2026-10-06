@@ -93,18 +93,46 @@ payload 为 TLV 字段序列 `[tag 1B][len 1B][value]`。
 | `MaxConsecutive` | 3 | 连续无法接受报文的降级帧数阈值 |
 | `Window` | 0（关闭） | >0 时改为滑动时间窗判定：窗口内异常累计达到 `MaxConsecutive` 即降级，**不要求严格连续**；帧间夹杂正常帧不清窗，异常随时间滑出窗口（在 `Advance` 时重评） |
 | `ReorderTolerance` | 0 | 允许的序号回退量（0 表示任何倒退都算异常） |
-| `RecoveryFrames` | 1 | 从 SAFE 恢复所需连续有效报文数 |
+| `RecoveryFrames` | 1 | 从 SAFE 恢复所需连续**故障后新报文**数（序号严格大于恢复门槛） |
 
 - **夹杂一帧正常报文**：任何被接受的帧（含容忍范围内乱序帧与不带序号
   的活性帧）立即清零连续异常计数（时间窗历史按 `Window` 规则保留）。
 - **乱序但在容忍范围内**：帧被接受并清零异常计数，但**不推进序号基线、
   不应用载荷**（迟到旧数据不得覆盖当前输出）；之后的重复帧仍按异常计。
 - **真正回退**：回退量 `baseline-seq > ReorderTolerance`，计一次异常。
-- **恢复边界**：进入 SAFE 的瞬间丢弃故障前的序号基线、连续计数与恢复
-  进度（通道的输出/最近值/序号也清零为安全初值）；恢复后的**首帧建立
-  全新基线**，即使它携带的是故障前的旧序号，也不会被判为倒退——恢复
-  只使用恢复之后的新报文，绝不沿用故障前的输出、序号或累计状态。
-- SAFE 期间恢复进度被新异常打断时重新计数；期间报文载荷一律不生效。
+- **恢复边界**：进入 SAFE 的瞬间丢弃连续异常计数、时间窗历史与恢复进度，
+  通道的输出/最近值/序号也清零为安全初值；**但故障前已接受的最大序号会
+  保留为“恢复门槛”**。恢复只承认故障之后真正新产生的报文。
+
+### 从 SAFE 恢复的判定口径（哪些算恢复、哪些不算）
+
+通道因连续不可用报文进入安全输出后，恢复必须满足：连续收到
+`RecoveryFrames`（默认 1）帧**故障后新报文**。判定以故障前已接受的最大
+序号 `high`（恢复门槛）为基准：
+
+| SAFE 期间到达的报文 | 判定 | 是否推进恢复进度 | 输出/载荷 |
+|---|---|---|---|
+| 序号 `> high`（严格大于故障前最新序号） | 故障后新报文 | 进度 +1，门槛同步抬高到该序号 | 集齐恢复帧数解除 SAFE 后采用其值 |
+| 序号 `== high`（与故障前最新序号相同，重放） | 异常（重复），计一次 `Fail` | 否，进度**清零** | 不生效 |
+| 序号 `< high` 且倒退量超过 `ReorderTolerance`（比故障前更旧） | 异常（真倒退），计一次 `Fail` | 否，进度**清零** | 不生效 |
+| 序号 `< high` 但在 `ReorderTolerance` 容忍内（乱序旧帧） | 接受为乱序帧、清零连续异常计数 | 否，进度**清零** | 不生效（旧数据不得覆盖输出） |
+| 不带序号的活性帧 | 活性信号、清零连续异常计数 | 否（也不清零已有进度） | 不生效 |
+| 坏帧（CRC/截断/版本/字段非法） | 异常 `Fail` | 否，进度**清零** | 不生效 |
+
+要点：
+
+- **故障前用过的任何序号都不能触发恢复，也不能把载荷写进控制输出**——
+  无论它与故障前最新序号相同还是更旧；通道必须等到序号确实比故障前接受
+  过的最新序号更大的报文。
+- **恢复进度的计算规则确定可复现**：进度 = 当前连续“故障后新报文”的
+  计数；旧报文（重复/倒退/容忍内乱序）或坏帧一旦穿插进来，进度立即归零，
+  之后从下一帧真正更新的报文重新连续累计，不会被旧报文带过去；活性帧
+  不影响进度。默认配置（`MaxConsecutive=3`、`RecoveryFrames=1`、
+  `ReorderTolerance=0`、无时间窗）下结果完全稳定。
+- 看门狗联动触发的外部 `Reset()` 仍会丢弃恢复门槛（采样链路整体重来，
+  此后首帧建立全新基线）；总线自身降级走 `trip()`，**保留**门槛。
+- SAFE 期间任何报文的载荷都不生效；只有在恢复帧数集齐、通道解除 SAFE
+  的那一帧故障后新报文，其值才会写入输出。
 
 ### 多通道并发与容量假设
 
@@ -142,7 +170,23 @@ go test -race -count=N ./...  # 多轮重复，验证并发用例稳定可复现
   缓冲超限丢弃后恢复（`TestBoundedDecoderDropsOverrunAndRecovers`）。
 - 总线异常计数与恢复（`internal/busfault`）：连续坏帧触发、正常帧清零、
   多帧恢复与异常打断、乱序容忍与真倒退、时间窗模式与过期遗忘、
-  恢复只认新报文。
+  旧序号不能恢复（`TestRecoveryUsesFreshFramesOnly`）、
+  旧报文穿插时恢复进度清零重算（`TestRecoveryProgressResetByStaleFrames`）、
+  活性帧不驱动恢复（`TestRecoveryLivenessDoesNotDriveRecovery`）。
+- 通道从 SAFE 恢复的判定（`internal/system`，`recovery_test.go`）：
+  - 故障后用故障前旧序号（相同/更旧/更早期序号、反复重放）不能恢复也不能
+    改输出（`TestRecoveryStaleFramesDoNotRecover`）；
+  - 只有序号严格更大的故障后新报文才能恢复并采用其值，门槛逐次抬高
+    （`TestRecoveryOnlyFreshSeqRecovers`）；
+  - 旧报文与更新报文穿插时，恢复进度按“连续新帧计数、旧帧清零重算”的
+    确定规则执行（`TestRecoveryProgressInterleaved`）；
+  - 一路通道恢复全程不影响其他通道（`TestRecoveryChannelIsolation`）；
+  - 默认配置下同一喂入序列多轮快照完全一致，确定可复现
+    （`TestRecoveryDeterministicDefaultConfig`）；
+  - 并发喂入（坏帧/旧帧/新帧）与状态读取下快照始终自洽，无半更新
+    （`TestRecoveryConcurrentSnapshotConsistency`，配合 `-race`）；
+  - 3000 次反复进入/退出 SAFE 行为稳定、计数有界、内存无积压增长
+    （`TestRecoveryLongRunBounded`）。
 - 通道级安全（`internal/system`）：
   - 连续坏帧降级、输出切安全值、其他通道不受影响
     （`TestBusBadFramesTripChannelSafe`）；
@@ -158,3 +202,13 @@ go test -race -count=N ./...  # 多轮重复，验证并发用例稳定可复现
   - 并发总线输入、采样推进与一致性快照（`TestConcurrentBusSnapshotConsistency`、
     `TestConcurrentAccess`，配合 `-race`）；
   - 通道截断归因（`TestFinishChannelBusTruncationCharged`）。
+
+### 本地复现“旧报文不能恢复”
+
+```sh
+# 观察恢复判定各用例的业务与结果（日志含每一步的状态/进度/输出）：
+go test ./internal/system/ -run 'TestRecovery' -v
+go test ./internal/busfault/ -run 'TestRecovery' -v
+# 全量回归（含既有调度、协议兼容、故障恢复用例）+ 竞态检测，多轮稳定：
+go test -race -count=3 ./...
+```
