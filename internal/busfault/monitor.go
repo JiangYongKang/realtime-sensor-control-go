@@ -14,8 +14,11 @@
 //     立即清零连续异常计数。
 //   - 乱序：序号回退量不超过 ReorderTolerance（默认 0）的帧被接受，
 //     但不推进序号基线；回退超过容忍量或序号重复按异常处理。
-//   - 恢复：SAFE 后收到连续 RecoveryFrames（默认 1）帧有效报文才回 OK；
-//     进入 SAFE 时序号基线与累计异常即被丢弃，恢复后的首帧建立新基线。
+//   - 恢复：SAFE 后收到连续 RecoveryFrames（默认 1）帧有效报文才回 OK。
+//     进入 SAFE 时故障前已接受的最大序号被记为“故障水位”：恢复期间
+//     只有序号严格大于故障水位的报文才算有效恢复帧（故障后新产生的
+//     报文）；重复、倒退、故障前已出现过的序号一律按异常处理，既不
+//     推进恢复进度也不生效载荷，并把恢复进度清零重新计数。
 package busfault
 
 import "time"
@@ -85,7 +88,12 @@ type Monitor struct {
 	consec      int // 当前连续异常数
 	recovery    int // SAFE 后连续有效报文数
 	hasBaseline bool
-	baseline    uint64      // 已接受的最大序号
+	baseline    uint64 // 已接受的最大序号
+	// faultSeq/hasFaultSeq 记录进入安全状态时故障前已接受的最大序号
+	// （故障水位）。恢复期间只有严格大于它的序号才算有效恢复帧；
+	// 水位只随更新后的基线单调抬升，跨多次故障保持有效。
+	faultSeq    uint64
+	hasFaultSeq bool
 	failTimes   []time.Time // Window>0 时记录的异常时刻（有界）
 	accepted    uint64
 	rejected    uint64
@@ -99,8 +107,16 @@ func New(cfg Config) *Monitor {
 // Frame 处理一帧带序号报文，at 为到达时刻，返回判定结果。
 func (m *Monitor) Frame(at time.Time, seq uint64) Result {
 	m.prune(at)
+	if m.safe && m.hasFaultSeq && seq <= m.faultSeq {
+		// 故障前已出现过的序号（重复/倒退/同序旧帧）：不算有效恢复，
+		// 按一次异常处理并清零恢复进度，载荷不得生效。
+		m.Fail(at)
+		return Rejected
+	}
 	if !m.hasBaseline {
 		// 启动后或 SAFE 复位后的首帧：建立全新序号基线。
+		// SAFE 期间能走到这里的序号必然严格大于故障水位，
+		// 即确实是故障之后新产生的报文。
 		m.hasBaseline = true
 		m.baseline = seq
 		return m.noteAccepted(at, Accepted)
@@ -175,9 +191,16 @@ func (m *Monitor) trip() {
 	m.Reset()
 }
 
-// Reset 丢弃序号基线、连续异常与恢复计数。
-// 在通道进入安全状态时调用，保证恢复后不沿用故障前状态。
+// Reset 丢弃序号基线、连续异常与恢复计数，但把当前已接受的最大序号
+// 记入故障水位：恢复期间只有严格大于该水位的序号才算有效恢复帧，
+// 故障前的旧报文（重复/倒退/同序）一律按异常处理。
+// 在通道进入安全状态时调用，保证恢复不沿用故障前状态。
 func (m *Monitor) Reset() {
+	if m.hasBaseline {
+		// 水位只随已接受的最大序号抬升；恢复期间建立的新基线
+		// 严格大于旧水位，多次故障下水位保持单调不减。
+		m.faultSeq, m.hasFaultSeq = m.baseline, true
+	}
 	m.hasBaseline = false
 	m.baseline = 0
 	m.consec = 0

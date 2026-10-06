@@ -273,7 +273,8 @@ func (s *System) FinishChannelBus(id string) error {
 //   - 乱序容忍帧（AcceptedReordered）只清零异常计数，不应用载荷，
 //     避免迟到旧数据覆盖当前输出。
 //   - 只要看门狗或总线监控任一处于 SAFE，所有载荷都不生效，输出保持
-//     安全值；恢复后的首帧建立全新序号基线并重新开始。
+//     安全值；恢复只认序号严格大于故障前已接受最大序号的新报文，
+//     故障前的旧报文（重复/倒退/同序）按异常处理并清零恢复进度。
 func (s *System) applyMessage(ch *channelState, m protocol.Message, now time.Time) {
 	var r busfault.Result
 	seqVal, seqErr := protocol.GetU64(m, protocol.TagSeq)

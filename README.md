@@ -100,10 +100,18 @@ payload 为 TLV 字段序列 `[tag 1B][len 1B][value]`。
 - **乱序但在容忍范围内**：帧被接受并清零异常计数，但**不推进序号基线、
   不应用载荷**（迟到旧数据不得覆盖当前输出）；之后的重复帧仍按异常计。
 - **真正回退**：回退量 `baseline-seq > ReorderTolerance`，计一次异常。
-- **恢复边界**：进入 SAFE 的瞬间丢弃故障前的序号基线、连续计数与恢复
-  进度（通道的输出/最近值/序号也清零为安全初值）；恢复后的**首帧建立
-  全新基线**，即使它携带的是故障前的旧序号，也不会被判为倒退——恢复
-  只使用恢复之后的新报文，绝不沿用故障前的输出、序号或累计状态。
+- **恢复边界**：进入 SAFE 的瞬间，故障前已接受的最大序号被记为
+  **故障水位**，同时丢弃序号基线、连续计数与恢复进度（通道的输出/
+  最近值/序号也清零为安全初值）。
+- **什么算有效恢复帧**：恢复期间只有序号**严格大于故障水位**的报文
+  （即确实是故障之后新产生的报文）才算有效恢复帧，连续集满
+  `RecoveryFrames` 帧后通道回到 OK 并采用其载荷。
+- **什么不算**：重复序号、倒退序号、以及故障前已出现过的任何序号
+  （`seq <= 故障水位`）一律按一次异常处理——既不推进恢复进度，也不
+  改动输出，并把已积累的恢复进度**清零重新计算**；因此先来旧报文、
+  后来真正新报文时，恢复进度从旧报文之后重新集齐，不会被旧报文
+  “带过去”。故障水位随每次进入 SAFE 时已接受的最大序号单调抬升，
+  多次进出安全状态后判定依然确定、可复现。
 - SAFE 期间恢复进度被新异常打断时重新计数；期间报文载荷一律不生效。
 
 ### 多通道并发与容量假设
@@ -142,11 +150,18 @@ go test -race -count=N ./...  # 多轮重复，验证并发用例稳定可复现
   缓冲超限丢弃后恢复（`TestBoundedDecoderDropsOverrunAndRecovers`）。
 - 总线异常计数与恢复（`internal/busfault`）：连续坏帧触发、正常帧清零、
   多帧恢复与异常打断、乱序容忍与真倒退、时间窗模式与过期遗忘、
-  恢复只认新报文。
+  恢复只认序号大于故障水位的新报文（`TestRecoveryUsesFreshFramesOnly`）、
+  旧报文夹杂时恢复进度清零重计（`TestRecoveryProgressRestartedByStaleFrames`）、
+  故障水位跨多次故障单调抬升（`TestFaultWatermarkAdvancesAcrossEpisodes`）。
 - 通道级安全（`internal/system`）：
   - 连续坏帧降级、输出切安全值、其他通道不受影响
     （`TestBusBadFramesTripChannelSafe`）；
   - 有效报文恢复且只用恢复后新报文（`TestBusRecoveryUsesFreshFrames`）；
+  - 故障后旧序号报文不能恢复也不能改输出，只有真正更新的报文才能恢复
+    （`TestBusStaleSeqCannotRecoverNorDriveOutput`）；
+  - 旧报文与新报文穿插时恢复进度清零重计
+    （`TestBusRecoveryProgressWithInterleavedStale`）；
+  - 一路通道恢复判定不影响其他通道（`TestBusRecoveryIsolationAcrossChannels`）；
   - 好帧坏帧穿插（`TestBusInterleavedGoodResetsCounter`）；
   - 序号重复/倒退计异常（`TestBusDuplicateAndRegressionCountAsFaults`）；
   - 乱序容忍可配置且乱序帧不覆盖输出（`TestBusReorderToleranceConfigurable`）；
@@ -156,5 +171,6 @@ go test -race -count=N ./...  # 多轮重复，验证并发用例稳定可复现
   - 多通道坏帧突发/巨长流隔离（`TestBusChannelIsolationUnderBurst`）；
   - 有界积压（`TestBusBoundedBacklog`）；
   - 并发总线输入、采样推进与一致性快照（`TestConcurrentBusSnapshotConsistency`、
-    `TestConcurrentAccess`，配合 `-race`）；
+    `TestConcurrentStaleRecoverySnapshotConsistency`、`TestConcurrentAccess`，
+    配合 `-race`）；
   - 通道截断归因（`TestFinishChannelBusTruncationCharged`）。

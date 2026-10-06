@@ -523,3 +523,156 @@ func TestFinishChannelBusTruncationCharged(t *testing.T) {
 		t.Fatal("截断帧应计为该通道一次异常（阈值 1 即降级）")
 	}
 }
+
+// ---- 故障后恢复判定：旧序号不得恢复 ----
+
+func TestBusStaleSeqCannotRecoverNorDriveOutput(t *testing.T) {
+	sys, _ := twoChannelSystem(busfault.DefaultConfig())
+	// 故障前接受 seq=5，输出 10。
+	sys.FeedChannelBus("a", ctrlFrame("a", 5, 10))
+	if st := sys.Snapshot().Channels["a"]; st.Output != 10 {
+		t.Fatalf("前置有效控制帧未生效: %+v", st)
+	}
+	// 连续 3 帧坏数据进入 SAFE。
+	for i := 0; i < 3; i++ {
+		sys.FeedChannelBus("a", badCRC(ctrlFrame("a", uint64(6+i), 11)))
+	}
+	if st := sys.Snapshot().Channels["a"]; st.State != "SAFE" || st.Output != -1 {
+		t.Fatalf("应进入 SAFE 且输出安全值: %+v", st)
+	}
+	// 与故障前同序的旧报文：不能恢复，也不能写输出。
+	sys.FeedChannelBus("a", ctrlFrame("a", 5, 99))
+	if st := sys.Snapshot().Channels["a"]; st.State != "SAFE" || st.Output != -1 {
+		t.Fatalf("同序旧报文不得恢复/改输出: %+v", st)
+	}
+	// 比故障前更旧的报文：同样无效。
+	sys.FeedChannelBus("a", ctrlFrame("a", 3, 98))
+	if st := sys.Snapshot().Channels["a"]; st.State != "SAFE" || st.Output != -1 {
+		t.Fatalf("更旧报文不得恢复/改输出: %+v", st)
+	}
+	// 只有序号真正更大的新报文才能恢复并采用其值。
+	sys.FeedChannelBus("a", ctrlFrame("a", 6, 42))
+	st := sys.Snapshot().Channels["a"]
+	if st.State != "OK" || st.Output != 42 || st.BusLastSeq != 6 {
+		t.Fatalf("真正的新报文应恢复并生效: %+v", st)
+	}
+}
+
+func TestBusRecoveryProgressWithInterleavedStale(t *testing.T) {
+	sys, _ := twoChannelSystem(busfault.Config{MaxConsecutive: 2, RecoveryFrames: 2})
+	sys.FeedChannelBus("a", ctrlFrame("a", 10, 1))
+	for i := 0; i < 2; i++ {
+		sys.FeedChannelBus("a", badCRC(ctrlFrame("a", uint64(11+i), 2)))
+	}
+	if st := sys.Snapshot().Channels["a"]; st.State != "SAFE" {
+		t.Fatalf("应进入 SAFE: %+v", st)
+	}
+	// 第 1 帧真正的新报文：进度 1/2，未恢复。
+	sys.FeedChannelBus("a", ctrlFrame("a", 11, 21))
+	if st := sys.Snapshot().Channels["a"]; st.State != "SAFE" || st.Output != -1 {
+		t.Fatalf("进度 1/2 不应恢复: %+v", st)
+	}
+	// 夹杂故障前旧序号：计异常且清零恢复进度。
+	sys.FeedChannelBus("a", ctrlFrame("a", 10, 99))
+	if st := sys.Snapshot().Channels["a"]; st.State != "SAFE" || st.Output != -1 {
+		t.Fatalf("旧序号不得推进恢复: %+v", st)
+	}
+	// 进度重新计算：还需连续 2 帧新报文，第一帧不够。
+	sys.FeedChannelBus("a", ctrlFrame("a", 12, 22))
+	if st := sys.Snapshot().Channels["a"]; st.State != "SAFE" {
+		t.Fatalf("进度被旧报文清零后需重新集齐: %+v", st)
+	}
+	sys.FeedChannelBus("a", ctrlFrame("a", 13, 23))
+	if st := sys.Snapshot().Channels["a"]; st.State != "OK" || st.Output != 23 {
+		t.Fatalf("连续 2 帧新报文后应恢复并生效: %+v", st)
+	}
+}
+
+func TestBusRecoveryIsolationAcrossChannels(t *testing.T) {
+	sys, _ := twoChannelSystem(busfault.DefaultConfig())
+	sys.FeedChannelBus("a", ctrlFrame("a", 7, 70))
+	sys.FeedChannelBus("b", ctrlFrame("b", 3, 30))
+	// a 进入 SAFE。
+	for i := 0; i < 3; i++ {
+		sys.FeedChannelBus("a", badCRC(ctrlFrame("a", uint64(8+i), 1)))
+	}
+	// a 恢复期间（含旧序号干扰），b 持续正常工作。
+	sys.FeedChannelBus("a", ctrlFrame("a", 7, 99)) // 旧序号，无效
+	for i := 4; i <= 8; i++ {
+		sys.FeedChannelBus("b", ctrlFrame("b", uint64(i), float64(i*10)))
+	}
+	snap := sys.Snapshot()
+	if st := snap.Channels["a"]; st.State != "SAFE" || st.Output != -1 {
+		t.Fatalf("a 旧序号不得恢复: %+v", st)
+	}
+	if st := snap.Channels["b"]; st.State != "OK" || st.Output != 80 || st.BusLastSeq != 8 {
+		t.Fatalf("b 不应受 a 恢复过程影响: %+v", st)
+	}
+	// a 用真正的新报文恢复后，b 状态依旧。
+	sys.FeedChannelBus("a", ctrlFrame("a", 8, 88))
+	snap = sys.Snapshot()
+	if snap.Channels["a"].State != "OK" || snap.Channels["a"].Output != 88 {
+		t.Fatalf("a 应恢复: %+v", snap.Channels["a"])
+	}
+	if snap.Channels["b"].State != "OK" || snap.Channels["b"].Output != 80 {
+		t.Fatalf("b 应一直保持正常: %+v", snap.Channels["b"])
+	}
+}
+
+func TestConcurrentStaleRecoverySnapshotConsistency(t *testing.T) {
+	sys, _ := twoChannelSystem(busfault.Config{MaxConsecutive: 2, RecoveryFrames: 2})
+	sys.Advance(start)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	// 通道 a：坏帧、故障前旧序号、新序号交替喂入，反复进出 SAFE。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		seq := uint64(1)
+		for i := 0; i < 300; i++ {
+			switch i % 4 {
+			case 0:
+				sys.FeedChannelBus("a", badCRC(ctrlFrame("a", seq, 1)))
+			case 1:
+				sys.FeedChannelBus("a", ctrlFrame("a", 1, 999)) // 旧序号干扰
+			default:
+				seq++
+				sys.FeedChannelBus("a", ctrlFrame("a", seq, float64(seq)))
+			}
+		}
+		close(stop)
+	}()
+	// 通道 b：持续有效报文，必须始终健康。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 1; i <= 200; i++ {
+			sys.FeedChannelBus("b", ctrlFrame("b", uint64(i), float64(i)))
+		}
+	}()
+	// 并发快照：SAFE 时输出必须是安全值且总线序号已清零（无半更新）。
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				snap := sys.Snapshot()
+				a := snap.Channels["a"]
+				if a.State == "SAFE" && (a.Output != -1 || a.BusLastSeq != 0) {
+					t.Errorf("SAFE 快照不一致: %+v", a)
+					return
+				}
+				if b := snap.Channels["b"]; b.State != "OK" {
+					t.Errorf("b 应始终健康: %+v", b)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}

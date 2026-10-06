@@ -46,17 +46,106 @@ func TestRecoveryUsesFreshFramesOnly(t *testing.T) {
 	if !m.Safe() {
 		t.Fatal("应进入 SAFE")
 	}
-	// 故障前序号 100 的旧帧重发：基线已被丢弃，它会被当作恢复后首帧接受，
-	// 建立新基线 100（而不是被判为倒退）——恢复只看恢复之后的报文。
-	if r := m.Frame(t0.Add(40*time.Millisecond), 100); r != Accepted {
-		t.Fatalf("result=%v, want Accepted as fresh baseline", r)
+	// 故障前序号 100 的旧帧重发：不算有效恢复，按异常处理。
+	if r := m.Frame(t0.Add(40*time.Millisecond), 100); r != Rejected {
+		t.Fatalf("故障前同序旧帧应判异常, result=%v", r)
+	}
+	if !m.Safe() {
+		t.Fatal("旧帧不得让通道恢复")
+	}
+	// 故障前更旧的序号同样不算恢复。
+	if r := m.Frame(t0.Add(50*time.Millisecond), 99); r != Rejected {
+		t.Fatalf("故障前更旧序号应判异常, result=%v", r)
+	}
+	if !m.Safe() {
+		t.Fatal("更旧序号不得让通道恢复")
+	}
+	// 只有严格大于故障前最大序号的新报文才算有效恢复。
+	if r := m.Frame(t0.Add(60*time.Millisecond), 101); r != Accepted {
+		t.Fatalf("故障后新报文应被接受, result=%v", r)
 	}
 	if m.Safe() {
-		t.Fatal("默认 1 帧恢复：应回到 OK")
+		t.Fatal("默认 1 帧恢复：真正的新报文应让通道回到 OK")
 	}
 	// 恢复后下一个更大的序号被接受。
-	if r := m.Frame(t0.Add(50*time.Millisecond), 101); r != Accepted || m.Safe() {
+	if r := m.Frame(t0.Add(70*time.Millisecond), 102); r != Accepted || m.Safe() {
 		t.Fatalf("result=%v safe=%v", r, m.Safe())
+	}
+}
+
+// 恢复进度只由真正的新报文推进：旧报文夹杂其间时按确定规则清零重计。
+func TestRecoveryProgressRestartedByStaleFrames(t *testing.T) {
+	m := New(Config{MaxConsecutive: 1, RecoveryFrames: 2})
+	m.Frame(t0, 10)
+	m.Fail(t0.Add(10 * time.Millisecond))
+	if !m.Safe() {
+		t.Fatal("阈值 1 应立即 SAFE")
+	}
+	// 第 1 帧真正的新报文：恢复进度 1/2，未恢复。
+	if r := m.Frame(t0.Add(20*time.Millisecond), 11); r != Accepted || !m.Safe() {
+		t.Fatalf("result=%v safe=%v", r, m.Safe())
+	}
+	// 夹杂故障前旧序号：计异常且清零恢复进度。
+	if r := m.Frame(t0.Add(30*time.Millisecond), 10); r != Rejected {
+		t.Fatalf("旧序号应判异常, result=%v", r)
+	}
+	// 进度被清零：之前那帧 11 不得被旧报文“带过去”，需重新集齐 2 帧。
+	if r := m.Frame(t0.Add(40*time.Millisecond), 12); r != Accepted || !m.Safe() {
+		t.Fatalf("进度重计后第 1 帧不应恢复, result=%v safe=%v", r, m.Safe())
+	}
+	if r := m.Frame(t0.Add(50*time.Millisecond), 13); r != Accepted || m.Safe() {
+		t.Fatalf("连续 2 帧新报文后应恢复, result=%v safe=%v", r, m.Safe())
+	}
+}
+
+// 恢复期间建立的新基线成为新的故障水位：再次故障后，恢复期旧序号同样失效。
+func TestFaultWatermarkAdvancesAcrossEpisodes(t *testing.T) {
+	m := New(Config{MaxConsecutive: 1, RecoveryFrames: 1})
+	m.Frame(t0, 10)
+	m.Fail(t0.Add(10 * time.Millisecond)) // SAFE，故障水位 10
+	m.Frame(t0.Add(20*time.Millisecond), 20)
+	if m.Safe() {
+		t.Fatal("新报文应恢复")
+	}
+	m.Fail(t0.Add(30 * time.Millisecond)) // 再次 SAFE，故障水位抬升为 20
+	if !m.Safe() {
+		t.Fatal("应再次进入 SAFE")
+	}
+	// 上一恢复期的序号 20 与故障前的 10 都已是旧报文。
+	for _, seq := range []uint64{10, 20} {
+		if r := m.Frame(t0.Add(40*time.Millisecond), seq); r != Rejected {
+			t.Fatalf("seq=%d 应判异常, result=%v", seq, r)
+		}
+	}
+	if !m.Safe() {
+		t.Fatal("旧报文不得恢复")
+	}
+	if r := m.Frame(t0.Add(50*time.Millisecond), 21); r != Accepted || m.Safe() {
+		t.Fatalf("只有大于新水位的报文才能恢复, result=%v safe=%v", r, m.Safe())
+	}
+}
+
+// 外部 Reset（看门狗触发安全时调用）同样记录故障水位。
+func TestResetRecordsFaultWatermark(t *testing.T) {
+	m := New(DefaultConfig())
+	m.Frame(t0, 42)
+	m.Reset()
+	if r := m.Frame(t0.Add(10*time.Millisecond), 42); r != Accepted {
+		// 注意：Reset 本身不置 SAFE，此处验证的是水位对 SAFE 恢复的影响，
+		// 非 SAFE 下首帧仍建立新基线。
+		t.Fatalf("result=%v", r)
+	}
+	// 进入 SAFE 后水位生效。
+	m2 := New(DefaultConfig())
+	m2.Frame(t0, 42)
+	m2.Fail(t0.Add(10 * time.Millisecond))
+	m2.Fail(t0.Add(20 * time.Millisecond))
+	m2.Fail(t0.Add(30 * time.Millisecond))
+	if !m2.Safe() {
+		t.Fatal("应进入 SAFE")
+	}
+	if r := m2.Frame(t0.Add(40*time.Millisecond), 42); r != Rejected {
+		t.Fatalf("SAFE 期间故障前序号应判异常, result=%v", r)
 	}
 }
 
